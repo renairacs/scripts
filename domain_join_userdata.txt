@@ -1,0 +1,112 @@
+<powershell>
+$LogFile = "C:\ProgramData\Amazon\EC2-Windows\Launch\Log\userdata.log"
+
+$Message = "Userdata Logs"
+$logDirectory = "C:\ProgramData\Amazon\EC2-Windows\Launch\Log"
+
+if (-not (Test-Path -Path $logDirectory)) {
+    New-Item -Path $logDirectory -ItemType Directory -Force
+}
+$Message | Out-File -FilePath $LogFile -Append
+
+Import-Module AWSPowerShell
+
+# Function to generate a random password
+function Generate-RandomPassword {
+    $length = 16
+    $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@-"
+    $passwordChars = 0..($length - 1) | ForEach-Object {
+        $chars[(Get-Random -Minimum 0 -Maximum $chars.Length)]
+    }
+    return -join $passwordChars
+}
+
+# Generate a new random password
+$newPassword = Generate-RandomPassword
+$adminUser = "Administrator"
+
+# Convert the plain text password to a secure string
+$securePassword = ConvertTo-SecureString $newPassword -AsPlainText -Force
+
+# Set the local user password
+Set-LocalUser -Name $adminUser -Password $securePassword
+
+# Log the password change
+$message = "The user's password '$adminUser' was successfully changed to: $newPassword at $(Get-Date)"
+Add-Content -Path $LogFile -Value $message
+
+# Save the new password in AWS Secrets Manager
+$secretName = "password-ec2-2-${environment}"
+$secretValue = @{"Password" = $newPassword} | ConvertTo-Json
+
+# Check if the secret already exists
+$existingSecret = Get-SECSecretValue -SecretId $secretName -ErrorAction SilentlyContinue
+
+if ($existingSecret) {
+    # Update the existing secret
+    Update-SECSecretValue -SecretId $secretName -SecretString $secretValue
+    Write-Host "Updated the secret '$secretName' with the new password."
+} else {
+    # Create a new secret
+    New-SECSecretValue -Name $secretName -SecretString $secretValue
+    Write-Host "Created a new secret '$secretName' with the password."
+}
+
+# Domain Information
+$directoryId = "${directory_id}"
+$directoryIp = "${directory_ip}" -split ","
+$dnsServer = "${dns_servers}" -split ","
+
+# Find the correct network interface name
+$interfaceAlias = (Get-NetAdapter | Where-Object { $_.Status -eq "Up" }).Name
+Write-Host "Using network interface: $interfaceAlias"
+
+# Set DNS server
+Set-DnsClientServerAddress -InterfaceAlias $interfaceAlias -ServerAddresses $dnsServer
+Restart-NetAdapter -Name $interfaceAlias -Confirm:$false
+Start-Sleep -Seconds 30
+
+# Test connection to DNS server
+$dnsTest = Test-Connection -ComputerName $dnsServer[0] -Count 2 -ErrorAction SilentlyContinue
+if (-not $dnsTest) {
+    Write-Host "Unable to reach DNS server: $($dnsServer[0])"
+    exit
+}
+
+# Join the instance to the domain
+$domainName = "${domain_name}"
+$domainUser = "admin"
+$domainPassword = "${domain_password}" | ConvertTo-SecureString -AsPlainText -Force
+
+# Domain credentials
+$domainCredential = New-Object System.Management.Automation.PSCredential ($domainUser, $domainPassword)
+
+# Name of the secret in Secrets Manager
+$secretName = "${domain_name}"
+
+try {
+    # Get the secret back
+    $secret = Get-SECSecretValue -SecretId $secretName
+    $secretJson = $secret.SecretString | ConvertFrom-Json
+    $domainPassword = $secretJson.Password
+
+    # Converte para SecureString
+    $securePassword = ConvertTo-SecureString $domainPassword -AsPlainText -Force
+    Write-Host "Domain password successfully retrieved from Secrets Manager."
+} catch {
+    Write-Host "Error retrieving the secret '$secretName': $_"
+    exit
+}
+
+# Domain credentials
+$domainUser = "admin"
+$domainCredential = New-Object System.Management.Automation.PSCredential ($domainUser, $securePassword)
+
+# Attempting to enter the domain
+try {
+    Add-Computer -DomainName $domainName -Credential $domainCredential -Force -Restart
+    Write-Host "Successfully joined the domain: $domainName"
+} catch {
+    Write-Host "Failed to join the domain: $_"
+}
+</powershell>
