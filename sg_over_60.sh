@@ -10,3 +10,5 @@ aws ec2 describe-security-groups --output json | jq '
     ( [.IpPermissions[].UserIdGroupPairs[]] | length )
   )
 } | select(.IngressCount >= 60)'
+
+# Describe security groups with 60 or more ingress rules
